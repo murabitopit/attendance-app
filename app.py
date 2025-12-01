@@ -28,7 +28,7 @@ def connect_to_gsheets():
     sh = client.open_by_url(sheet_url)
     return sh
 
-# --- シート操作関数 (リトライ機能付き) ---
+# --- シート操作関数 ---
 def init_sheets():
     try:
         sh = connect_to_gsheets()
@@ -41,10 +41,13 @@ def init_sheets():
     except Exception as e:
         st.error(f"シート接続エラー: {e}")
 
-# ★修正: エラーが出たら3回までリトライする頑丈な関数に変更
-@st.cache_data(ttl=10) # キャッシュ時間を5→10秒に延長
-def get_users():
-    for _ in range(3): # 3回挑戦
+@st.cache_data(ttl=5)
+def get_users_stable():
+    if 'cached_users_df' not in st.session_state:
+        st.session_state.cached_users_df = pd.DataFrame()
+    
+    # リトライロジック
+    for _ in range(3):
         try:
             sh = connect_to_gsheets()
             ws = sh.worksheet("users")
@@ -53,13 +56,17 @@ def get_users():
             expected_cols = ["id", "name", "rest_balance", "paid_leave_balance", "initial_fine", "last_reset_week", "last_reset_month"]
             if df.empty or not set(expected_cols).issubset(df.columns):
                 return pd.DataFrame(columns=expected_cols)
+            st.session_state.cached_users_df = df
             return df
         except Exception:
-            t.sleep(1) # 失敗したら1秒待つ
-    return pd.DataFrame() # 3回ダメなら空を返す
+            t.sleep(1)
+    return st.session_state.cached_users_df
 
-@st.cache_data(ttl=10)
-def get_records():
+@st.cache_data(ttl=5)
+def get_records_stable():
+    if 'cached_records_df' not in st.session_state:
+        st.session_state.cached_records_df = pd.DataFrame()
+        
     for _ in range(3):
         try:
             sh = connect_to_gsheets()
@@ -69,14 +76,15 @@ def get_records():
             expected_cols = ["id", "user_id", "date", "clock_in", "clock_out", "status", "fine", "note"]
             if df.empty or not set(expected_cols).issubset(df.columns):
                 return pd.DataFrame(columns=expected_cols)
+            st.session_state.cached_records_df = df
             return df
         except Exception:
             t.sleep(1)
-    return pd.DataFrame()
+    return st.session_state.cached_records_df
 
 def clear_cache():
-    get_users.clear()
-    get_records.clear()
+    get_users_stable.clear()
+    get_records_stable.clear()
 
 def find_row_num(worksheet, col_name, value):
     try:
@@ -91,15 +99,6 @@ def add_user(name):
     new_id = str(uuid.uuid4())
     ws.append_row([new_id, name, 0, 0, 0, "", ""])
     clear_cache()
-
-def update_user_balance_direct(user_id, col_name, new_val):
-    sh = connect_to_gsheets()
-    ws = sh.worksheet("users")
-    row = find_row_num(ws, "id", user_id)
-    if row:
-        col = ws.find(col_name).col
-        ws.update_cell(row, col, new_val)
-        clear_cache()
 
 def update_user_balance(user_id, col_name, amount):
     sh = connect_to_gsheets()
@@ -133,7 +132,6 @@ def add_record(user_id, status, fine=0, note="", clock_in="", clock_out="", date
     if date_str is None:
         now = datetime.now(JST)
         date_str = now.strftime('%Y-%m-%d')
-    
     rec_id = str(uuid.uuid4())
     ws.append_row([rec_id, user_id, date_str, clock_in, clock_out, status, fine, note])
     clear_cache()
@@ -141,7 +139,6 @@ def add_record(user_id, status, fine=0, note="", clock_in="", clock_out="", date
 def update_record_out(user_id, clock_out_obj, status, fine, note_append):
     sh = connect_to_gsheets()
     ws = sh.worksheet("records")
-    
     if isinstance(clock_out_obj, datetime):
         clock_out_str = clock_out_obj.strftime('%H:%M:%S')
     else:
@@ -151,6 +148,7 @@ def update_record_out(user_id, clock_out_obj, status, fine, note_append):
     target_row_idx = -1
     record_data = None
     
+    # まだ退勤していない最新の自分の記録を探す（日付跨ぎ対応）
     for i, r in enumerate(reversed(records)):
         if str(r['user_id']) == str(user_id) and (r['clock_out'] is None or str(r['clock_out']).strip() == ""):
             real_index = (len(records) - 1) - i
@@ -168,11 +166,10 @@ def update_record_out(user_id, clock_out_obj, status, fine, note_append):
         
         early_fine = 0
         if today_date > clock_in_date:
-            early_fine = 0
+            early_fine = 0 # 日付跨ぎは早退なし
         else:
             is_holiday_work = "休日出勤" in str(record_data['status']) or "土日祝" in str(record_data['note'])
             if not is_holiday_work:
-                # 引数がdatetimeか確認して計算
                 if isinstance(clock_out_obj, datetime):
                     early_fine = calculate_early_fine(clock_out_obj)
         
@@ -219,7 +216,7 @@ def update_initial_fine(user_id, amount):
 def update_user_name(user_id, new_name):
     sh = connect_to_gsheets()
     ws = sh.worksheet("users")
-    current_users = get_users()
+    current_users = get_users_stable()
     if not current_users.empty:
         exists = current_users[(current_users['name'] == new_name) & (current_users['id'].astype(str) != str(user_id))]
         if not exists.empty:
@@ -265,7 +262,7 @@ def get_week_label(date_str):
     except:
         return ""
 
-# --- 自動処理: 付与 & 未登録埋め ---
+# --- 自動処理 ---
 def auto_fill_missing_days(user_id, current_rest_balance):
     sh = connect_to_gsheets()
     ws_r = sh.worksheet("records")
@@ -314,23 +311,18 @@ def auto_force_checkout():
         sh = connect_to_gsheets()
         ws = sh.worksheet("records")
         records = ws.get_all_records()
-        
         now_dt = datetime.now(JST)
         today_str = now_dt.strftime('%Y-%m-%d')
         force_time_str = "23:55:00"
-        
         updated_count = 0
         
         for i, r in enumerate(records):
             if r['clock_out'] is None or str(r['clock_out']).strip() == "":
                 rec_date_str = r['date']
                 should_close = False
-                
-                if rec_date_str < today_str:
-                    should_close = True
+                if rec_date_str < today_str: should_close = True
                 elif rec_date_str == today_str:
-                    if now_dt.hour == 23 and now_dt.minute >= 55:
-                        should_close = True
+                    if now_dt.hour == 23 and now_dt.minute >= 55: should_close = True
                 
                 if should_close:
                     row_idx = i + 2
@@ -343,19 +335,15 @@ def auto_force_checkout():
         if updated_count > 0:
             clear_cache()
             st.toast(f"{updated_count}件の未退勤レコードを23:55で締めました")
-            
         st.session_state.last_force_checkout = now_dt
-
-    except Exception:
-        pass
+    except Exception: pass
 
 def run_global_auto_grant():
     if 'last_check' in st.session_state:
         if (datetime.now(JST) - st.session_state.last_check).total_seconds() < 60:
             return
-
     try:
-        users_df = get_users()
+        users_df = get_users_stable()
         today = datetime.now(JST)
         cur_week = today.strftime("%Y-%W")
         cur_month = today.strftime("%Y-%m")
@@ -495,24 +483,27 @@ def main():
     run_global_auto_grant()
     auto_force_checkout()
 
-    try:
-        users = get_users()
-    except Exception as e:
-        # st.error(f"接続エラー") 
-        return # エラー時は静かに終了
-
-    if users.empty: user_names = {}
-    else: user_names = {row['name']: str(row['id']) for index, row in users.iterrows()}
+    users = get_users_stable() # 安定版取得
+    
+    if users is None or users.empty:
+        # 初回起動などで空の場合は空の辞書
+        user_names = {}
+        if users is None: # 取得エラー
+             # 続行不能なので空で表示
+             pass
+    else:
+        user_names = {row['name']: str(row['id']) for index, row in users.iterrows()}
     
     if 'delete_confirm_id' not in st.session_state: st.session_state.delete_confirm_id = None
     if 'last_checked_user' not in st.session_state: st.session_state.last_checked_user = None
 
     st.write("##### 👤 使用者を選択してください")
-    selected_user_name = st.selectbox("名前を選択", ["(選択してください)"] + list(user_names.keys()), label_visibility="collapsed")
+    selected_user_name = st.selectbox("名前を選択", ["(選択してください)"] + list(user_names.keys()), label_visibility="collapsed", key="main_user_selector")
     
     if selected_user_name != "(選択してください)":
         user_id = user_names[selected_user_name]
         
+        # ユーザー切り替え時のみ未登録日チェック
         if st.session_state.last_checked_user != user_id:
             u_current = users[users['id'].astype(str) == user_id].iloc[0]
             filled_logs = auto_fill_missing_days(user_id, int(u_current['rest_balance']))
@@ -529,9 +520,7 @@ def main():
     with tab1:
         if selected_user_name != "(選択してください)":
             user_id = user_names[selected_user_name]
-            u_row = users[users['id'].astype(str) == user_id]
-            if u_row.empty: st.stop()
-            u_row = u_row.iloc[0]
+            u_row = users[users['id'].astype(str) == user_id].iloc[0]
             
             st.write(f"### {selected_user_name} さんの操作")
             col1, col2 = st.columns([1, 1])
@@ -602,7 +591,7 @@ def main():
         cal_user = c_u.selectbox("表示する人", list(user_names.keys()), index=def_index)
         cal_uid = user_names[cal_user]
         
-        df = get_records()
+        df = get_records_stable()
         if not df.empty and not users.empty:
             df['date_dt'] = pd.to_datetime(df['date'])
             df_m = df[(df['date_dt'].dt.year == sel_year) & 
@@ -618,24 +607,39 @@ def main():
             
             st.divider()
             st.subheader("📊 週別・累計リスト (全員)")
+            
+            # 全員表示のために「ユーザー一覧」をベースにする
             df_all_m = df[(df['date_dt'].dt.year == sel_year) & (df['date_dt'].dt.month == sel_month)].copy()
             df_all_m['fine'] = pd.to_numeric(df_all_m['fine'], errors='coerce').fillna(0)
-            df_all_fine = df_all_m[df_all_m['fine'] > 0]
-            if not df_all_fine.empty:
+            
+            # 罰金がないレコードも含むが、そもそも「名簿」にいる全員を表示したい
+            # まずレコードを週ごとに集計
+            if not df_all_m.empty:
                 users['id'] = users['id'].astype(str)
-                df_all_fine['user_id'] = df_all_fine['user_id'].astype(str)
-                merged = pd.merge(df_all_fine, users[['id', 'name', 'initial_fine']], left_on='user_id', right_on='id', how='left')
+                df_all_m['user_id'] = df_all_m['user_id'].astype(str)
+                merged = pd.merge(df_all_m, users[['id', 'name']], left_on='user_id', right_on='id', how='left')
                 merged['week'] = merged['date'].apply(get_week_label)
+                
+                # pivot
                 pivot = merged.pivot_table(index='name', columns='week', values='fine', aggfunc='sum', fill_value=0)
-                u_init = users[['name', 'initial_fine']].set_index('name')
-                u_init['initial_fine'] = pd.to_numeric(u_init['initial_fine'], errors='coerce').fillna(0)
-                pivot = pivot.join(u_init, how='left').fillna(0)
-                pivot.rename(columns={'initial_fine': '運用前罰金'}, inplace=True)
-                pivot['Total'] = pivot.sum(axis=1)
-                cols = ['運用前罰金'] + [c for c in pivot.columns if c not in ['運用前罰金', 'Total']] + ['Total']
-                st.dataframe(pivot[cols], use_container_width=True)
-            else: st.caption("この月の罰金データはありません")
-        else: st.info("データがありません")
+            else:
+                pivot = pd.DataFrame() # レコードなし
+                
+            # ユーザー名簿(users)と結合して、レコードがない人も表示する
+            u_base = users[['name', 'initial_fine']].set_index('name')
+            u_base['initial_fine'] = pd.to_numeric(u_base['initial_fine'], errors='coerce').fillna(0)
+            
+            # u_base (全員) に pivot (実績) を結合
+            final_df = u_base.join(pivot, how='left').fillna(0)
+            final_df.rename(columns={'initial_fine': '運用前罰金'}, inplace=True)
+            final_df['Total'] = final_df.sum(axis=1)
+            
+            # 表示列整理
+            cols = ['運用前罰金'] + [c for c in final_df.columns if c not in ['運用前罰金', 'Total']] + ['Total']
+            st.dataframe(final_df[cols], use_container_width=True)
+
+        else:
+            st.info("データがありません")
 
     # --- Tab 3: 休暇管理 ---
     with tab3:
@@ -643,7 +647,8 @@ def main():
         if not users.empty:
             view_df = users[['name', 'rest_balance', 'paid_leave_balance']].copy()
             view_df.columns = ['名前', '休み(残)', '有休(残)']
-            df_r = get_records()
+            
+            df_r = get_records_stable()
             usage_data = []
             if not df_r.empty:
                 df_r['user_id'] = df_r['user_id'].astype(str)
@@ -653,20 +658,23 @@ def main():
                     rest_used = len(u_recs[u_recs['status'] == '休み'])
                     paid_used = len(u_recs[u_recs['status'] == '有休'])
                     usage_data.append({'名前': u_row['name'], '休み(使用)': rest_used, '有休(使用)': paid_used})
+            
             df_usage = pd.DataFrame(usage_data)
             if df_usage.empty: df_usage = pd.DataFrame(columns=['名前', '休み(使用)', '有休(使用)'])
+
             c3_1, c3_2 = st.columns(2)
-            with c3_1: st.dataframe(view_df.style.applymap(lambda x: 'color:blue', subset=['休み(残)']).applymap(lambda x: 'color:green', subset=['有休(残)']), use_container_width=True)
-            with c3_2: st.dataframe(df_usage, use_container_width=True)
+            with c3_1:
+                st.dataframe(view_df.style.applymap(lambda x: 'color:blue', subset=['休み(残)']).applymap(lambda x: 'color:green', subset=['有休(残)']), use_container_width=True)
+            with c3_2:
+                st.dataframe(df_usage, use_container_width=True)
 
     # --- Tab 4: 全ログ ---
     with tab4:
-        df = get_records()
+        df = get_records_stable()
         if not df.empty:
             users['id'] = users['id'].astype(str)
             df['user_id'] = df['user_id'].astype(str)
             merged = pd.merge(df, users[['id', 'name']], left_on='user_id', right_on='id', how='left')
-            # ★修正: 罰金金額を数値化して表示
             merged['fine'] = pd.to_numeric(merged['fine'], errors='coerce').fillna(0).astype(int)
             st.dataframe(merged[['date', 'name', 'clock_in', 'clock_out', 'status', 'fine', 'note']].iloc[::-1], use_container_width=True)
 
@@ -734,7 +742,7 @@ def main():
             with st.expander("③ 日別レコードの修正"):
                 edit_date = st.date_input("修正する日付を選択", value=datetime.now(JST))
                 conn = connect_to_gsheets()
-                df_r = get_records()
+                df_r = get_records_stable()
                 edit_date_str = edit_date.strftime('%Y-%m-%d')
                 rec = df_r[(df_r['user_id'].astype(str) == tid) & (df_r['date'] == edit_date_str)]
                 if not rec.empty:
