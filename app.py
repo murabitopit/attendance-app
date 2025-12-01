@@ -41,27 +41,23 @@ def init_sheets():
     except Exception as e:
         st.error(f"シート接続エラー: {e}")
 
-# ★修正: データが空でも列定義を強制する
 @st.cache_data(ttl=5)
 def get_users():
     sh = connect_to_gsheets()
     ws = sh.worksheet("users")
     data = ws.get_all_records()
     df = pd.DataFrame(data)
-    # カラムが不足している場合は強制的に作成
     expected_cols = ["id", "name", "rest_balance", "paid_leave_balance", "initial_fine", "last_reset_week", "last_reset_month"]
     if df.empty or not set(expected_cols).issubset(df.columns):
         return pd.DataFrame(columns=expected_cols)
     return df
 
-# ★修正: データが空でも列定義を強制する
 @st.cache_data(ttl=5)
 def get_records():
     sh = connect_to_gsheets()
     ws = sh.worksheet("records")
     data = ws.get_all_records()
     df = pd.DataFrame(data)
-    # カラムが不足している場合は強制的に作成
     expected_cols = ["id", "user_id", "date", "clock_in", "clock_out", "status", "fine", "note"]
     if df.empty or not set(expected_cols).issubset(df.columns):
         return pd.DataFrame(columns=expected_cols)
@@ -147,6 +143,7 @@ def update_record_out(user_id, clock_out, status, fine, note_append):
     if target_row_idx > 0:
         current_note = ws.cell(target_row_idx, 8).value or ""
         new_note = (str(current_note) + " " + note_append).strip()
+        
         ws.update_cell(target_row_idx, 5, clock_out)
         ws.update_cell(target_row_idx, 6, status)
         ws.update_cell(target_row_idx, 7, fine)
@@ -265,7 +262,6 @@ def auto_fill_missing_days(user_id, current_rest_balance):
         return fill_log
     return []
 
-# --- 自動処理: 23:55強制退勤 ---
 def auto_force_checkout():
     if 'last_force_checkout' in st.session_state:
         if (datetime.now(JST) - st.session_state.last_force_checkout).total_seconds() < 60:
@@ -392,7 +388,7 @@ def admin_update_record(record_id, edit_date, new_in_t, new_out_t, new_note, mod
         msg_type = "warning"
     return msg, msg_type
 
-# --- カレンダーHTML生成 ---
+# --- カレンダーHTML生成 (Todo風デザイン) ---
 def generate_calendar_html(year, month, df_data, user_name):
     cal = calendar.Calendar(firstweekday=6) 
     month_days = cal.monthdayscalendar(year, month)
@@ -453,7 +449,8 @@ def main():
         init_sheets()
         st.session_state.init_done = True
     
-    run_global_auto_grant() 
+    run_global_auto_grant()
+    auto_force_checkout()
 
     try:
         users = get_users()
@@ -465,7 +462,6 @@ def main():
     else: user_names = {row['name']: str(row['id']) for index, row in users.iterrows()}
     
     if 'delete_confirm_id' not in st.session_state: st.session_state.delete_confirm_id = None
-    # ★追加: 前回チェックしたユーザーを記録する変数
     if 'last_checked_user' not in st.session_state: st.session_state.last_checked_user = None
 
     st.write("##### 👤 使用者を選択してください")
@@ -474,18 +470,15 @@ def main():
     if selected_user_name != "(選択してください)":
         user_id = user_names[selected_user_name]
         
-        # ★修正: 「ユーザーを切り替えた時」だけ自動チェックを実行する
+        # ユーザー切替時のみ未登録日チェック
         if st.session_state.last_checked_user != user_id:
             u_current = users[users['id'].astype(str) == user_id].iloc[0]
-            
             filled_logs = auto_fill_missing_days(user_id, int(u_current['rest_balance']))
             if filled_logs:
                 for log in filled_logs:
                     st.toast(f"自動登録: {log}")
                 t.sleep(2)
                 st.rerun()
-            
-            # チェック完了として記録
             st.session_state.last_checked_user = user_id
 
     tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["打刻・申請", "罰金集計", "休暇管理", "全ログ", "名簿登録", "管理者"])
@@ -570,6 +563,7 @@ def main():
         df = get_records()
         if not df.empty and not users.empty:
             df['date_dt'] = pd.to_datetime(df['date'])
+            # 年月・ユーザーでフィルタ
             df_m = df[(df['date_dt'].dt.year == sel_year) & 
                       (df['date_dt'].dt.month == sel_month) & 
                       (df['user_id'].astype(str) == cal_uid)].copy()
@@ -605,7 +599,7 @@ def main():
                 
                 cols = ['運用前罰金'] + [c for c in pivot.columns if c not in ['運用前罰金', 'Total']] + ['Total']
                 st.dataframe(pivot[cols], use_container_width=True)
-            else: st.caption("この月の罰金データはありません")
+            else: st.caption("この月の罰金データはありません (リスト表示)")
         else: st.info("データがありません")
 
     # --- Tab 3: 休暇管理 ---
