@@ -453,8 +453,7 @@ def main():
         init_sheets()
         st.session_state.init_done = True
     
-    run_global_auto_grant()
-    auto_force_checkout() # 強制退勤チェック
+    run_global_auto_grant() 
 
     try:
         users = get_users()
@@ -466,20 +465,28 @@ def main():
     else: user_names = {row['name']: str(row['id']) for index, row in users.iterrows()}
     
     if 'delete_confirm_id' not in st.session_state: st.session_state.delete_confirm_id = None
+    # ★追加: 前回チェックしたユーザーを記録する変数
+    if 'last_checked_user' not in st.session_state: st.session_state.last_checked_user = None
 
     st.write("##### 👤 使用者を選択してください")
     selected_user_name = st.selectbox("名前を選択", ["(選択してください)"] + list(user_names.keys()), label_visibility="collapsed")
     
     if selected_user_name != "(選択してください)":
         user_id = user_names[selected_user_name]
-        u_current = users[users['id'].astype(str) == user_id].iloc[0]
         
-        filled_logs = auto_fill_missing_days(user_id, int(u_current['rest_balance']))
-        if filled_logs:
-            for log in filled_logs:
-                st.toast(f"自動登録: {log}")
-            t.sleep(2)
-            st.rerun()
+        # ★修正: 「ユーザーを切り替えた時」だけ自動チェックを実行する
+        if st.session_state.last_checked_user != user_id:
+            u_current = users[users['id'].astype(str) == user_id].iloc[0]
+            
+            filled_logs = auto_fill_missing_days(user_id, int(u_current['rest_balance']))
+            if filled_logs:
+                for log in filled_logs:
+                    st.toast(f"自動登録: {log}")
+                t.sleep(2)
+                st.rerun()
+            
+            # チェック完了として記録
+            st.session_state.last_checked_user = user_id
 
     tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["打刻・申請", "罰金集計", "休暇管理", "全ログ", "名簿登録", "管理者"])
 
