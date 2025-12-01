@@ -17,7 +17,7 @@ MAX_DAILY_FINE = 1000
 # 日本時間 (JST)
 JST = timezone(timedelta(hours=9))
 
-# --- Google Sheets 接続設定 ---
+# --- Google Sheets 接続設定 (キャッシュ化) ---
 @st.cache_resource
 def connect_to_gsheets():
     scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
@@ -41,19 +41,31 @@ def init_sheets():
     except Exception as e:
         st.error(f"シート接続エラー: {e}")
 
+# ★修正: データが空でも列定義を強制する
 @st.cache_data(ttl=5)
 def get_users():
     sh = connect_to_gsheets()
     ws = sh.worksheet("users")
     data = ws.get_all_records()
-    return pd.DataFrame(data)
+    df = pd.DataFrame(data)
+    # カラムが不足している場合は強制的に作成
+    expected_cols = ["id", "name", "rest_balance", "paid_leave_balance", "initial_fine", "last_reset_week", "last_reset_month"]
+    if df.empty or not set(expected_cols).issubset(df.columns):
+        return pd.DataFrame(columns=expected_cols)
+    return df
 
+# ★修正: データが空でも列定義を強制する
 @st.cache_data(ttl=5)
 def get_records():
     sh = connect_to_gsheets()
     ws = sh.worksheet("records")
     data = ws.get_all_records()
-    return pd.DataFrame(data)
+    df = pd.DataFrame(data)
+    # カラムが不足している場合は強制的に作成
+    expected_cols = ["id", "user_id", "date", "clock_in", "clock_out", "status", "fine", "note"]
+    if df.empty or not set(expected_cols).issubset(df.columns):
+        return pd.DataFrame(columns=expected_cols)
+    return df
 
 def clear_cache():
     get_users.clear()
@@ -72,6 +84,15 @@ def add_user(name):
     new_id = str(uuid.uuid4())
     ws.append_row([new_id, name, 0, 0, 0, "", ""])
     clear_cache()
+
+def update_user_balance_direct(user_id, col_name, new_val):
+    sh = connect_to_gsheets()
+    ws = sh.worksheet("users")
+    row = find_row_num(ws, "id", user_id)
+    if row:
+        col = ws.find(col_name).col
+        ws.update_cell(row, col, new_val)
+        clear_cache()
 
 def update_user_balance(user_id, col_name, amount):
     sh = connect_to_gsheets()
@@ -105,6 +126,7 @@ def add_record(user_id, status, fine=0, note="", clock_in="", clock_out="", date
     if date_str is None:
         now = datetime.now(JST)
         date_str = now.strftime('%Y-%m-%d')
+    
     rec_id = str(uuid.uuid4())
     ws.append_row([rec_id, user_id, date_str, clock_in, clock_out, status, fine, note])
     clear_cache()
@@ -203,7 +225,7 @@ def get_week_label(date_str):
     except:
         return ""
 
-# --- 自動処理: 未登録日の自動埋め ---
+# --- 自動処理: 付与 & 未登録埋め ---
 def auto_fill_missing_days(user_id, current_rest_balance):
     sh = connect_to_gsheets()
     ws_r = sh.worksheet("records")
@@ -243,13 +265,8 @@ def auto_fill_missing_days(user_id, current_rest_balance):
         return fill_log
     return []
 
-# --- 自動処理: 23:55強制退勤 (NEW!) ---
+# --- 自動処理: 23:55強制退勤 ---
 def auto_force_checkout():
-    """
-    「退勤時刻が未入力」かつ
-    「日付が今日より前」または「今日だが23:55を過ぎている」レコードを
-    強制的に退勤済にする
-    """
     if 'last_force_checkout' in st.session_state:
         if (datetime.now(JST) - st.session_state.last_force_checkout).total_seconds() < 60:
             return
@@ -266,31 +283,22 @@ def auto_force_checkout():
         updated_count = 0
         
         for i, r in enumerate(records):
-            # 退勤が空
             if r['clock_out'] is None or str(r['clock_out']).strip() == "":
                 rec_date_str = r['date']
                 should_close = False
                 
-                # 1. 過去の日付なら即クローズ
                 if rec_date_str < today_str:
                     should_close = True
-                # 2. 今日で、かつ23:55を過ぎていればクローズ
                 elif rec_date_str == today_str:
                     if now_dt.hour == 23 and now_dt.minute >= 55:
                         should_close = True
                 
                 if should_close:
                     row_idx = i + 2
-                    
-                    # 備考に追記
                     current_note = r['note'] or ""
                     new_note = (str(current_note) + " (強制退勤)").strip()
-                    
-                    # 罰金などはそのまま（遅刻罰金は維持、早退罰金は23:55なら0円）
-                    # statusに退勤済をつけるかはお好みだが、とりあえず時間を埋める
-                    
-                    ws.update_cell(row_idx, 5, force_time_str) # clock_out
-                    ws.update_cell(row_idx, 8, new_note)       # note
+                    ws.update_cell(row_idx, 5, force_time_str)
+                    ws.update_cell(row_idx, 8, new_note)
                     updated_count += 1
         
         if updated_count > 0:
@@ -302,7 +310,6 @@ def auto_force_checkout():
     except Exception:
         pass
 
-# --- 自動付与 (月曜/月初) ---
 def run_global_auto_grant():
     if 'last_check' in st.session_state:
         if (datetime.now(JST) - st.session_state.last_check).total_seconds() < 60:
@@ -446,11 +453,8 @@ def main():
         init_sheets()
         st.session_state.init_done = True
     
-    # 1. 休暇などの自動付与チェック
     run_global_auto_grant()
-    
-    # 2. 強制退勤チェック (NEW)
-    auto_force_checkout()
+    auto_force_checkout() # 強制退勤チェック
 
     try:
         users = get_users()
@@ -470,7 +474,6 @@ def main():
         user_id = user_names[selected_user_name]
         u_current = users[users['id'].astype(str) == user_id].iloc[0]
         
-        # 3. 未登録日の自動埋め
         filled_logs = auto_fill_missing_days(user_id, int(u_current['rest_balance']))
         if filled_logs:
             for log in filled_logs:
@@ -510,7 +513,7 @@ def main():
                         early_fine = 0
                         if not (is_holiday or holiday_chk): early_fine = calculate_early_fine(now)
                         status_add = "/早退" if early_fine > 0 else ""
-                        if update_record_out(user_id, now.strftime('%H:%M:%S'), "退勤済"+status_add, early_fine, note):
+                        if update_record_out(user_id, now, "退勤済"+status_add, early_fine, note):
                             st.toast("退勤しました"); st.success("退勤しました"); t.sleep(3); st.rerun()
                         else: st.error("出勤記録が見つかりません")
             with col2:
@@ -545,13 +548,14 @@ def main():
                             st.toast("登録しました"); st.success("登録しました"); t.sleep(3); st.rerun()
         else: st.info("👆 上のボックスから名前を選択してください")
 
-    # --- Tab 2: 罰金 ---
+    # --- Tab 2: 罰金 (Googleカレンダー風) ---
     with tab2:
         st.subheader("🗓️ 罰金カレンダー")
         now_t = datetime.now(JST)
         c_y, c_m, c_u = st.columns([1, 1, 2])
         sel_year = c_y.number_input("年", value=now_t.year, step=1)
         sel_month = c_m.number_input("月", value=now_t.month, min_value=1, max_value=12, step=1)
+        
         def_index = list(user_names.keys()).index(selected_user_name) if selected_user_name in user_names else 0
         cal_user = c_u.selectbox("表示する人", list(user_names.keys()), index=def_index)
         cal_uid = user_names[cal_user]
@@ -559,28 +563,39 @@ def main():
         df = get_records()
         if not df.empty and not users.empty:
             df['date_dt'] = pd.to_datetime(df['date'])
-            df_m = df[(df['date_dt'].dt.year == sel_year) & (df['date_dt'].dt.month == sel_month) & (df['user_id'].astype(str) == cal_uid)].copy()
+            df_m = df[(df['date_dt'].dt.year == sel_year) & 
+                      (df['date_dt'].dt.month == sel_month) & 
+                      (df['user_id'].astype(str) == cal_uid)].copy()
             df_m['fine'] = pd.to_numeric(df_m['fine'], errors='coerce').fillna(0)
+            
             cal_html = generate_calendar_html(sel_year, sel_month, df_m, cal_user)
             st.markdown(cal_html, unsafe_allow_html=True)
+            
             total_fine = df_m['fine'].sum()
             st.info(f"💰 {cal_user} さんの {sel_month}月 罰金合計: ¥{int(total_fine):,}")
+            
             st.divider()
             st.subheader("📊 週別・累計リスト (全員)")
+            
             df_all_m = df[(df['date_dt'].dt.year == sel_year) & (df['date_dt'].dt.month == sel_month)].copy()
             df_all_m['fine'] = pd.to_numeric(df_all_m['fine'], errors='coerce').fillna(0)
             df_all_fine = df_all_m[df_all_m['fine'] > 0]
+            
             if not df_all_fine.empty:
                 users['id'] = users['id'].astype(str)
                 df_all_fine['user_id'] = df_all_fine['user_id'].astype(str)
                 merged = pd.merge(df_all_fine, users[['id', 'name', 'initial_fine']], left_on='user_id', right_on='id', how='left')
                 merged['week'] = merged['date'].apply(get_week_label)
+                
                 pivot = merged.pivot_table(index='name', columns='week', values='fine', aggfunc='sum', fill_value=0)
+                
                 u_init = users[['name', 'initial_fine']].set_index('name')
                 u_init['initial_fine'] = pd.to_numeric(u_init['initial_fine'], errors='coerce').fillna(0)
+                
                 pivot = pivot.join(u_init, how='left').fillna(0)
                 pivot.rename(columns={'initial_fine': '運用前罰金'}, inplace=True)
                 pivot['Total'] = pivot.sum(axis=1)
+                
                 cols = ['運用前罰金'] + [c for c in pivot.columns if c not in ['運用前罰金', 'Total']] + ['Total']
                 st.dataframe(pivot[cols], use_container_width=True)
             else: st.caption("この月の罰金データはありません")
@@ -592,6 +607,7 @@ def main():
         if not users.empty:
             view_df = users[['name', 'rest_balance', 'paid_leave_balance']].copy()
             view_df.columns = ['名前', '休み(残)', '有休(残)']
+            
             df_r = get_records()
             usage_data = []
             if not df_r.empty:
@@ -602,11 +618,15 @@ def main():
                     rest_used = len(u_recs[u_recs['status'] == '休み'])
                     paid_used = len(u_recs[u_recs['status'] == '有休'])
                     usage_data.append({'名前': u_row['name'], '休み(使用)': rest_used, '有休(使用)': paid_used})
+            
             df_usage = pd.DataFrame(usage_data)
             if df_usage.empty: df_usage = pd.DataFrame(columns=['名前', '休み(使用)', '有休(使用)'])
+
             c3_1, c3_2 = st.columns(2)
-            with c3_1: st.dataframe(view_df.style.applymap(lambda x: 'color:blue', subset=['休み(残)']).applymap(lambda x: 'color:green', subset=['有休(残)']), use_container_width=True)
-            with c3_2: st.dataframe(df_usage, use_container_width=True)
+            with c3_1:
+                st.dataframe(view_df.style.applymap(lambda x: 'color:blue', subset=['休み(残)']).applymap(lambda x: 'color:green', subset=['有休(残)']), use_container_width=True)
+            with c3_2:
+                st.dataframe(df_usage, use_container_width=True)
 
     # --- Tab 4: 全ログ ---
     with tab4:
