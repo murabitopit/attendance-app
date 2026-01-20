@@ -10,6 +10,7 @@ import calendar
 
 # --- 設定 ---
 WORK_START_HOUR = 9
+WORK_SPLIT_HOUR = 13 # 半休の区切り
 WORK_END_HOUR = 15
 DEADLINE_APPLY = time(8, 0, 0)
 MAX_DAILY_FINE = 1000
@@ -45,7 +46,6 @@ def init_sheets():
 def get_users_stable():
     if 'cached_users_df' not in st.session_state:
         st.session_state.cached_users_df = pd.DataFrame()
-    
     for _ in range(3):
         try:
             sh = connect_to_gsheets()
@@ -57,15 +57,13 @@ def get_users_stable():
                 return pd.DataFrame(columns=expected_cols)
             st.session_state.cached_users_df = df
             return df
-        except Exception:
-            t.sleep(1)
+        except Exception: t.sleep(1)
     return st.session_state.cached_users_df
 
 @st.cache_data(ttl=5)
 def get_records_stable():
     if 'cached_records_df' not in st.session_state:
         st.session_state.cached_records_df = pd.DataFrame()
-        
     for _ in range(3):
         try:
             sh = connect_to_gsheets()
@@ -77,8 +75,7 @@ def get_records_stable():
                 return pd.DataFrame(columns=expected_cols)
             st.session_state.cached_records_df = df
             return df
-        except Exception:
-            t.sleep(1)
+        except Exception: t.sleep(1)
     return st.session_state.cached_records_df
 
 def clear_cache():
@@ -89,8 +86,7 @@ def find_row_num(worksheet, col_name, value):
     try:
         cell = worksheet.find(str(value), in_column=worksheet.find(col_name).col)
         return cell.row if cell else None
-    except:
-        return None
+    except: return None
 
 def add_user(name):
     sh = connect_to_gsheets()
@@ -106,8 +102,9 @@ def update_user_balance(user_id, col_name, amount):
     if row:
         col = ws.find(col_name).col
         val = ws.cell(row, col).value
-        current_val = int(val) if val else 0
-        ws.update_cell(row, col, current_val + amount)
+        # ★修正: 半休(0.5)に対応するためfloat変換
+        current_val = float(val) if val else 0.0
+        ws.update_cell(row, col, current_val + float(amount))
         clear_cache()
 
 def update_user_field_direct(user_id, col_name, value):
@@ -125,14 +122,14 @@ def delete_user_data(user_id):
     if row: ws_u.delete_rows(row)
     clear_cache()
 
-# --- 重複チェック関数 ---
 def has_record_for_date(user_id, date_str):
     df = get_records_stable()
-    if df.empty: return False
-    exists = df[(df['user_id'].astype(str) == str(user_id)) & (df['date'] == date_str)]
-    return not exists.empty
+    if df.empty: return False, None
+    rec = df[(df['user_id'].astype(str) == str(user_id)) & (df['date'] == date_str)]
+    if not rec.empty:
+        return True, rec.iloc[0] # 存在する場合、そのレコード情報を返す
+    return False, None
 
-# --- レコード追加 ---
 def add_record(user_id, status, fine=0, note="", clock_in="", clock_out="", date_str=None):
     sh = connect_to_gsheets()
     ws = sh.worksheet("records")
@@ -140,21 +137,48 @@ def add_record(user_id, status, fine=0, note="", clock_in="", clock_out="", date
         now = datetime.now(JST)
         date_str = now.strftime('%Y-%m-%d')
     
-    if has_record_for_date(user_id, date_str):
-        return False, "本日は既に記録が存在します (1日1回のみ登録可能)"
+    exists, _ = has_record_for_date(user_id, date_str)
+    if exists:
+        return False, "本日は既に記録が存在します"
 
     rec_id = str(uuid.uuid4())
     ws.append_row([rec_id, user_id, date_str, clock_in, clock_out, status, fine, note])
     clear_cache()
     return True, "登録しました"
 
+# ★追加: 既存の半休レコードに出勤時間を追記する関数
+def update_half_day_clock_in(user_id, clock_in_time_obj, fine, note_append):
+    sh = connect_to_gsheets()
+    ws = sh.worksheet("records")
+    date_str = datetime.now(JST).strftime('%Y-%m-%d')
+    
+    records = ws.get_all_records()
+    target_row_idx = -1
+    
+    # 今日の自分のレコードを探す
+    for i, r in enumerate(reversed(records)):
+        if str(r['user_id']) == str(user_id) and r['date'] == date_str:
+            real_index = (len(records) - 1) - i
+            target_row_idx = real_index + 2
+            break
+    
+    if target_row_idx > 0:
+        clock_in_str = clock_out_str = str(clock_in_time_obj) if not isinstance(clock_in_time_obj, datetime) else clock_in_time_obj.strftime('%H:%M:%S')
+        
+        current_note = ws.cell(target_row_idx, 8).value or ""
+        new_note = (str(current_note) + " " + note_append).strip()
+        
+        ws.update_cell(target_row_idx, 4, clock_in_str) # clock_inを更新
+        ws.update_cell(target_row_idx, 7, fine)         # 遅刻罰金を更新
+        ws.update_cell(target_row_idx, 8, new_note)
+        clear_cache()
+        return True
+    return False
+
 def update_record_out(user_id, clock_out_obj, status, fine, note_append):
     sh = connect_to_gsheets()
     ws = sh.worksheet("records")
-    if isinstance(clock_out_obj, datetime):
-        clock_out_str = clock_out_obj.strftime('%H:%M:%S')
-    else:
-        clock_out_str = str(clock_out_obj)
+    clock_out_str = str(clock_out_obj) if not isinstance(clock_out_obj, datetime) else clock_out_obj.strftime('%H:%M:%S')
 
     records = ws.get_all_records()
     target_row_idx = -1
@@ -168,20 +192,25 @@ def update_record_out(user_id, clock_out_obj, status, fine, note_append):
             break
             
     if target_row_idx > 0 and record_data:
-        try:
-            clock_in_date = datetime.strptime(record_data['date'], '%Y-%m-%d').date()
-        except:
-            clock_in_date = datetime.now(JST).date()
-
+        try: clock_in_date = datetime.strptime(record_data['date'], '%Y-%m-%d').date()
+        except: clock_in_date = datetime.now(JST).date()
         today_date = datetime.now(JST).date()
+        
         early_fine = 0
         if today_date > clock_in_date:
-            early_fine = 0
+            early_fine = 0 
         else:
-            is_holiday_work = "休日出勤" in str(record_data['status']) or "土日祝" in str(record_data['note'])
+            # ★修正: ステータスによって定時を変える
+            status_txt = str(record_data['status'])
+            is_holiday_work = "休日出勤" in status_txt or "土日祝" in str(record_data['note'])
+            
+            target_end_hour = WORK_END_HOUR # デフォルト15時
+            if "午後休" in status_txt:
+                target_end_hour = WORK_SPLIT_HOUR # 午後休なら13時帰り
+
             if not is_holiday_work:
                 if isinstance(clock_out_obj, datetime):
-                    early_fine = calculate_early_fine(clock_out_obj)
+                    early_fine = calculate_early_fine(clock_out_obj, target_end_hour)
         
         current_status = record_data['status']
         status_add = "/早退" if early_fine > 0 else ""
@@ -229,8 +258,7 @@ def update_user_name(user_id, new_name):
     current_users = get_users_stable()
     if not current_users.empty:
         exists = current_users[(current_users['name'] == new_name) & (current_users['id'].astype(str) != str(user_id))]
-        if not exists.empty:
-            return False, "その名前は既に使用されています"
+        if not exists.empty: return False, "その名前は既に使用されています"
     row = find_row_num(ws, "id", user_id)
     if row:
         col = ws.find("name").col
@@ -239,15 +267,15 @@ def update_user_name(user_id, new_name):
         return True, "名前を変更しました"
     return False, "ユーザーが見つかりません"
 
-def apply_leave(user_id, leave_type, target_date):
+def apply_leave(user_id, leave_type, target_date, cost):
     date_str = target_date.strftime('%Y-%m-%d')
-    if has_record_for_date(user_id, date_str):
-        return False, f"{date_str} は既に記録があります"
+    exists, _ = has_record_for_date(user_id, date_str)
+    if exists: return False, f"{date_str} は既に記録があります"
 
     today = datetime.now(JST).date()
     now_time = datetime.now(JST).time()
     
-    if leave_type == "有休":
+    if "有休" in leave_type:
         if target_date == today and now_time > DEADLINE_APPLY:
             return False, "当日の有給申請は8:00までです"
         if target_date < today:
@@ -256,7 +284,11 @@ def apply_leave(user_id, leave_type, target_date):
     sh = connect_to_gsheets()
     ws = sh.worksheet("records")
     rec_id = str(uuid.uuid4())
-    ws.append_row([rec_id, user_id, date_str, "-", "-", leave_type, 0, "申請利用"])
+    # 半休の場合はclock_in/outを空にしておく（あとで打刻するため）
+    # 全日休みの場合は "-"
+    clk = "-" if cost >= 1.0 else ""
+    
+    ws.append_row([rec_id, user_id, date_str, clk, clk, leave_type, 0, "申請利用"])
     clear_cache()
     return True, f"{date_str} の「{leave_type}」を登録しました"
 
@@ -269,18 +301,27 @@ def register_absence(user_id):
 def is_weekend(dt):
     return dt.weekday() >= 5
 
-def calculate_late_fine(check_in_dt):
+# ★修正: 遅刻判定の開始時間を可変に
+def calculate_late_fine(check_in_dt, start_hour=WORK_START_HOUR):
     hour = check_in_dt.hour
-    if hour < WORK_START_HOUR: return 0, "通常"
-    if hour == 9: return 500, "遅刻"
-    elif hour == 10: return 600, "遅刻"
-    elif hour == 11: return 700, "遅刻"
-    elif hour == 12: return 800, "遅刻"
-    elif hour == 13: return 900, "遅刻"
+    
+    # 指定時間より前ならセーフ
+    if hour < start_hour: return 0, "通常"
+    
+    # 遅刻ロジック (1時間刻みで500円〜)
+    # 開始時間が9時以外の場合(午後休明けなど)も同様に +0, +1, +2時間で計算
+    diff = hour - start_hour
+    
+    if diff == 0: return 500, "遅刻"
+    elif diff == 1: return 600, "遅刻"
+    elif diff == 2: return 700, "遅刻"
+    elif diff == 3: return 800, "遅刻"
+    elif diff == 4: return 900, "遅刻"
     else: return 1000, "欠勤(遅刻超過)"
 
-def calculate_early_fine(check_out_dt):
-    end_dt = check_out_dt.replace(hour=WORK_END_HOUR, minute=0, second=0, microsecond=0)
+# ★修正: 早退判定の終了時間を可変に
+def calculate_early_fine(check_out_dt, end_hour=WORK_END_HOUR):
+    end_dt = check_out_dt.replace(hour=end_hour, minute=0, second=0, microsecond=0)
     if check_out_dt >= end_dt: return 0
     diff = end_dt - check_out_dt
     hours_early = math.ceil(diff.total_seconds() / 3600)
@@ -290,10 +331,8 @@ def get_week_label(date_str):
     try:
         dt = pd.to_datetime(date_str)
         week_num = (dt.day - 1) // 7 + 1
-        # ソート順を保証するために 24.01.1 のようにゼロ埋めする
         return f"{dt.strftime('%y')}.{dt.month:02}.{week_num}"
-    except:
-        return ""
+    except: return ""
 
 # --- 自動処理 ---
 def auto_fill_missing_days(user_id, current_rest_balance):
@@ -305,16 +344,19 @@ def auto_fill_missing_days(user_id, current_rest_balance):
     existing_dates = set([r['date'] for r in user_recs])
     today = datetime.now(JST).date()
     start_date = date(today.year, today.month, 1)
-    temp_rest_balance = current_rest_balance
+    
+    # バランス計算用
+    temp_rest_balance = float(current_rest_balance)
     fill_log = []
+    
     check_date = start_date
     while check_date < today:
         date_s = check_date.strftime('%Y-%m-%d')
         if not is_weekend(check_date) and date_s not in existing_dates:
             rec_id = str(uuid.uuid4())
-            if temp_rest_balance > 0:
+            if temp_rest_balance >= 1.0:
                 ws_r.append_row([rec_id, user_id, date_s, "", "", "休み", 0, "自動適用"])
-                temp_rest_balance -= 1
+                temp_rest_balance -= 1.0
                 fill_log.append(f"{date_s}: 休み(残消化)")
             else:
                 ws_r.append_row([rec_id, user_id, date_s, "", "", "欠勤", 1000, "自動適用"])
@@ -332,8 +374,7 @@ def auto_fill_missing_days(user_id, current_rest_balance):
 
 def auto_force_checkout():
     if 'last_force_checkout' in st.session_state:
-        if (datetime.now(JST) - st.session_state.last_force_checkout).total_seconds() < 60:
-            return
+        if (datetime.now(JST) - st.session_state.last_force_checkout).total_seconds() < 60: return
     try:
         sh = connect_to_gsheets()
         ws = sh.worksheet("records")
@@ -347,9 +388,7 @@ def auto_force_checkout():
                 rec_date_str = r['date']
                 should_close = False
                 if rec_date_str < today_str: should_close = True
-                elif rec_date_str == today_str:
-                    if now_dt.hour == 23 and now_dt.minute >= 55: should_close = True
-                
+                elif rec_date_str == today_str and (now_dt.hour == 23 and now_dt.minute >= 55): should_close = True
                 if should_close:
                     row_idx = i + 2
                     current_note = r['note'] or ""
@@ -377,12 +416,12 @@ def run_global_auto_grant():
             last_w = str(u['last_reset_week'])
             last_m = str(u['last_reset_month'])
             if today.weekday() == 0 and last_w != cur_week:
-                update_user_field_direct(uid, "rest_balance", 1)
+                update_user_field_direct(uid, "rest_balance", float(u['rest_balance']) + 1.0)
                 update_user_field_direct(uid, "last_reset_week", cur_week)
                 st.toast(f"月曜日: {u['name']}さんの休みリセット")
                 updates = True
             if today.day == 1 and last_m != cur_month:
-                update_user_field_direct(uid, "paid_leave_balance", 2)
+                update_user_field_direct(uid, "paid_leave_balance", float(u['paid_leave_balance']) + 2.0)
                 update_user_field_direct(uid, "last_reset_month", cur_month)
                 st.toast(f"月初: {u['name']}さんの有給リセット")
                 updates = True
@@ -403,7 +442,7 @@ def admin_force_grant_all(grant_type):
         if grant_type == "rest":
             col_bal = ws.find("rest_balance").col
             col_last = ws.find("last_reset_week").col
-            ws.update_cell(row, col_bal, 1)
+            ws.update_cell(row, col_bal, 1) # 強制付与は1にする？+1にする？ とりあえず1リセット
             ws.update_cell(row, col_last, cur_week)
             count += 1
         elif grant_type == "paid":
@@ -519,17 +558,14 @@ def main():
         
         if st.session_state.last_checked_user != user_id:
             u_current = users[users['id'].astype(str) == user_id].iloc[0]
-            filled_logs = auto_fill_missing_days(user_id, int(u_current['rest_balance']))
+            filled_logs = auto_fill_missing_days(user_id, float(u_current['rest_balance']))
             st.session_state.last_checked_user = user_id 
             if filled_logs:
-                for log in filled_logs:
-                    st.toast(f"自動登録: {log}")
-                t.sleep(2)
-                st.rerun()
+                for log in filled_logs: st.toast(f"自動登録: {log}")
+                t.sleep(2); st.rerun()
 
     tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["打刻・申請", "罰金集計", "休暇管理", "全ログ", "名簿登録", "管理者"])
 
-    # --- Tab 1: 打刻 ---
     with tab1:
         if selected_user_name != "(選択してください)":
             user_id = user_names[selected_user_name]
@@ -542,54 +578,88 @@ def main():
                 is_holiday = is_weekend(datetime.now(JST))
                 holiday_chk = st.checkbox("祝日・休日出勤 (罰金なし)", value=is_holiday)
                 
+                # ★修正: 出勤ボタンのロジック (半休対応)
                 if st.button("出勤 🟢", type="primary", use_container_width=True):
                     now = datetime.now(JST)
-                    fine, status = 0, "休日出勤"
-                    if not (is_holiday or holiday_chk): fine, status = calculate_late_fine(now)
-                    if fine > MAX_DAILY_FINE: fine = MAX_DAILY_FINE
+                    date_str = now.strftime('%Y-%m-%d')
                     
-                    success, msg = add_record(user_id, status, fine, clock_in=now.strftime('%H:%M:%S'), note="土日祝" if (is_holiday or holiday_chk) else "")
+                    # 今日のレコードがあるかチェック
+                    exists, rec = has_record_for_date(user_id, date_str)
                     
-                    if success:
-                        st.toast(f"出勤しました ({status})"); st.success("出勤しました"); t.sleep(2); st.rerun()
+                    if exists:
+                        # 既にレコードがある場合
+                        status_val = str(rec['status'])
+                        if "午前休" in status_val:
+                            # 午前休なら13時出勤扱い
+                            fine, _ = calculate_late_fine(now, start_hour=WORK_SPLIT_HOUR)
+                            if fine > MAX_DAILY_FINE: fine = MAX_DAILY_FINE
+                            update_half_day_clock_in(user_id, now, fine, "(午前休出勤)")
+                            st.toast("出勤しました(午前休)"); st.success("出勤しました"); t.sleep(2); st.rerun()
+                        elif "午後休" in status_val:
+                            # 午後休なら9時出勤扱い
+                            fine, _ = calculate_late_fine(now, start_hour=WORK_START_HOUR)
+                            if fine > MAX_DAILY_FINE: fine = MAX_DAILY_FINE
+                            update_half_day_clock_in(user_id, now, fine, "(午後休出勤)")
+                            st.toast("出勤しました(午後休)"); st.success("出勤しました"); t.sleep(2); st.rerun()
+                        else:
+                            st.error("本日は既に記録が存在します")
                     else:
-                        st.error(msg)
+                        # 新規出勤
+                        fine, status = 0, "休日出勤"
+                        if not (is_holiday or holiday_chk): fine, status = calculate_late_fine(now)
+                        if fine > MAX_DAILY_FINE: fine = MAX_DAILY_FINE
+                        
+                        success, msg = add_record(user_id, status, fine, clock_in=now.strftime('%H:%M:%S'), note="土日祝" if (is_holiday or holiday_chk) else "")
+                        if success: st.toast(f"出勤しました ({status})"); st.success("出勤しました"); t.sleep(2); st.rerun()
+                        else: st.error(msg)
 
                 with st.form(key="clock_out_form", clear_on_submit=True):
                     note = st.text_input("退勤備考")
                     if st.form_submit_button("退勤 🔴", use_container_width=True):
                         now = datetime.now(JST)
-                        early_fine = 0
-                        if not (is_holiday or holiday_chk): early_fine = calculate_early_fine(now)
-                        status_add = "/早退" if early_fine > 0 else ""
-                        if update_record_out(user_id, now, "退勤済"+status_add, early_fine, note):
+                        # 退勤ロジック(update_record_out内で半休判定済み)
+                        if update_record_out(user_id, now, "退勤済", 0, note):
                             st.toast("退勤しました"); st.success("退勤しました"); t.sleep(3); st.rerun()
                         else: st.error("出勤記録が見つかりません")
             with col2:
+                # 残数表示を少数対応に
+                rest_b = float(u_row['rest_balance'])
+                paid_b = float(u_row['paid_leave_balance'])
                 st.markdown(f"""
                 <div style="background-color:#f0f2f6; padding:10px; border-radius:5px; margin-bottom:10px;">
-                    <strong>現在の残数:</strong> 休 <span style="font-size:1.2em; color:blue;">{u_row['rest_balance']}</span> / 有 <span style="font-size:1.2em; color:green;">{u_row['paid_leave_balance']}</span>
+                    <strong>現在の残数:</strong> 休 <span style="font-size:1.2em; color:blue;">{rest_b:.1f}</span> / 有 <span style="font-size:1.2em; color:green;">{paid_b:.1f}</span>
                 </div>""", unsafe_allow_html=True)
+                
                 with st.form(key="leave_form", clear_on_submit=True):
-                    t_date = st.date_input("有給日付", value=datetime.now(JST))
-                    c1, c2 = st.columns(2)
-                    if c1.form_submit_button("休み使用 (本日)"):
-                        if u_row['rest_balance'] > 0:
-                            success, msg = add_record(user_id, "休み", 0, "申請利用", date_str=datetime.now(JST).strftime('%Y-%m-%d'))
+                    t_date = st.date_input("日付", value=datetime.now(JST))
+                    # 休暇タイプ選択
+                    leave_option = st.selectbox("種類を選択", ["休み(全日) -1.0", "午前休(9-13時休み) -0.5", "午後休(13-15時休み) -0.5", "有給(全日) -1.0"])
+                    
+                    submitted = st.form_submit_button("申請・使用")
+                    
+                    if submitted:
+                        cost = 1.0
+                        l_type = "休み"
+                        target_bal = "rest_balance"
+                        
+                        if "午前休" in leave_option:
+                            cost = 0.5; l_type = "午前休"
+                        elif "午後休" in leave_option:
+                            cost = 0.5; l_type = "午後休"
+                        elif "有給" in leave_option:
+                            l_type = "有休"; target_bal = "paid_leave_balance"
+                        
+                        current_bal = float(u_row[target_bal])
+                        
+                        if current_bal >= cost:
+                            success, msg = apply_leave(user_id, l_type, t_date, cost)
                             if success:
-                                update_user_balance(user_id, "rest_balance", -1)
-                                st.toast("休みを使用しました"); st.success("休みを使用しました"); t.sleep(3); st.rerun()
-                            else:
-                                st.error(msg)
-                        else: st.error("残数がありません")
-                    if c2.form_submit_button("有給申請"):
-                        if u_row['paid_leave_balance'] > 0:
-                            success, msg = apply_leave(user_id, "有休", t_date)
-                            if success:
-                                update_user_balance(user_id, "paid_leave_balance", -1)
-                                st.toast("有給を申請しました"); st.success("有給を申請しました"); t.sleep(3); st.rerun()
-                            else: st.error(msg) 
-                        else: st.error("残数がありません")
+                                update_user_balance(user_id, target_bal, -cost)
+                                st.toast(f"{l_type}を使用しました"); st.success(f"{l_type}を使用しました"); t.sleep(3); st.rerun()
+                            else: st.error(msg)
+                        else:
+                            st.error(f"残数が足りません (必要: {cost}, 残: {current_bal})")
+
                 st.divider()
                 if st.button("無断・通常欠勤 (¥1000)", use_container_width=True):
                     register_absence(user_id); t.sleep(3); st.rerun()
@@ -600,13 +670,10 @@ def main():
                         if st.form_submit_button("確定", type="secondary"):
                             final_reason = reas if reas != "その他" else detail
                             success, msg = add_record(user_id, "特別欠勤", 0, final_reason)
-                            if success:
-                                st.toast("登録しました"); st.success("登録しました"); t.sleep(3); st.rerun()
-                            else:
-                                st.error(msg)
+                            if success: st.toast("登録しました"); st.success("登録しました"); t.sleep(3); st.rerun()
+                            else: st.error(msg)
         else: st.info("👆 上のボックスから名前を選択してください")
 
-    # --- Tab 2: 罰金 ---
     with tab2:
         st.subheader("🗓️ 罰金カレンダー")
         now_t = datetime.now(JST)
@@ -620,9 +687,7 @@ def main():
         df = get_records_stable()
         if not df.empty and not users.empty:
             df['date_dt'] = pd.to_datetime(df['date'])
-            df_m = df[(df['date_dt'].dt.year == sel_year) & 
-                      (df['date_dt'].dt.month == sel_month) & 
-                      (df['user_id'].astype(str) == cal_uid)].copy()
+            df_m = df[(df['date_dt'].dt.year == sel_year) & (df['date_dt'].dt.month == sel_month) & (df['user_id'].astype(str) == cal_uid)].copy()
             df_m['fine'] = pd.to_numeric(df_m['fine'], errors='coerce').fillna(0)
             cal_html = generate_calendar_html(sel_year, sel_month, df_m, cal_user)
             st.markdown(cal_html, unsafe_allow_html=True)
@@ -631,40 +696,36 @@ def main():
             
             st.divider()
             st.subheader("📊 週別・累計リスト (全期間)")
-            
-            df_all_m = df.copy() # 全データを使用
-            df_all_m['date_dt'] = pd.to_datetime(df_all_m['date']) # 日付型変換
+            df_all_m = df.copy()
+            df_all_m['date_dt'] = pd.to_datetime(df_all_m['date'])
             df_all_m['fine'] = pd.to_numeric(df_all_m['fine'], errors='coerce').fillna(0)
-            
             users['id'] = users['id'].astype(str)
             if not df_all_m.empty:
                 df_all_m['user_id'] = df_all_m['user_id'].astype(str)
                 merged = pd.merge(df_all_m, users[['id', 'name']], left_on='user_id', right_on='id', how='left')
                 merged['week'] = merged['date'].apply(get_week_label)
                 pivot = merged.pivot_table(index='name', columns='week', values='fine', aggfunc='sum', fill_value=0)
-            else:
-                pivot = pd.DataFrame()
-
+            else: pivot = pd.DataFrame()
             u_init = users[['name', 'initial_fine']].set_index('name')
             u_init['initial_fine'] = pd.to_numeric(u_init['initial_fine'], errors='coerce').fillna(0)
             pivot = pivot.join(u_init, how='outer').fillna(0)
             pivot.rename(columns={'initial_fine': '運用前罰金'}, inplace=True)
             pivot['Total'] = pivot.sum(axis=1)
-            
-            # カラムをソート（運用前罰金、週ラベル、Total）
             cols = [c for c in pivot.columns if c not in ['運用前罰金', 'Total']]
-            cols.sort() # 年.月.週 でソートされる
+            cols.sort()
             final_cols = ['運用前罰金'] + cols + ['Total']
-            
             st.dataframe(pivot[final_cols], use_container_width=True)
         else: st.info("データがありません")
 
-    # --- Tab 3: 休暇管理 ---
     with tab3:
         st.write("#### 🔹 休暇可能な残数")
         if not users.empty:
             view_df = users[['name', 'rest_balance', 'paid_leave_balance']].copy()
             view_df.columns = ['名前', '休み(残)', '有休(残)']
+            # floatで見やすく
+            view_df['休み(残)'] = view_df['休み(残)'].astype(float)
+            view_df['有休(残)'] = view_df['有休(残)'].astype(float)
+            
             df_r = get_records_stable()
             usage_data = []
             if not df_r.empty:
@@ -672,16 +733,16 @@ def main():
                 for idx, u_row in users.iterrows():
                     uid = str(u_row['id'])
                     u_recs = df_r[df_r['user_id'] == uid]
-                    rest_used = len(u_recs[u_recs['status'] == '休み'])
-                    paid_used = len(u_recs[u_recs['status'] == '有休'])
-                    usage_data.append({'名前': u_row['name'], '休み(使用)': rest_used, '有休(使用)': paid_used})
+                    # 半休などもカウントに含める（回数ベースか日数ベースか。ここでは回数）
+                    rest_used = len(u_recs[u_recs['status'].str.contains('休み|午前休|午後休')])
+                    paid_used = len(u_recs[u_recs['status'].str.contains('有休')])
+                    usage_data.append({'名前': u_row['name'], '休み(使用回数)': rest_used, '有休(使用回数)': paid_used})
             df_usage = pd.DataFrame(usage_data)
-            if df_usage.empty: df_usage = pd.DataFrame(columns=['名前', '休み(使用)', '有休(使用)'])
+            if df_usage.empty: df_usage = pd.DataFrame(columns=['名前', '休み(使用回数)', '有休(使用回数)'])
             c3_1, c3_2 = st.columns(2)
-            with c3_1: st.dataframe(view_df.style.applymap(lambda x: 'color:blue', subset=['休み(残)']).applymap(lambda x: 'color:green', subset=['有休(残)']), use_container_width=True)
+            with c3_1: st.dataframe(view_df.style.format("{:.1f}").applymap(lambda x: 'color:blue', subset=['休み(残)']).applymap(lambda x: 'color:green', subset=['有休(残)']), use_container_width=True)
             with c3_2: st.dataframe(df_usage, use_container_width=True)
 
-    # --- Tab 4: 全ログ ---
     with tab4:
         df = get_records_stable()
         if not df.empty:
@@ -691,7 +752,6 @@ def main():
             merged['fine'] = pd.to_numeric(merged['fine'], errors='coerce').fillna(0).astype(int)
             st.dataframe(merged[['date', 'name', 'clock_in', 'clock_out', 'status', 'fine', 'note']].iloc[::-1], use_container_width=True)
 
-    # --- Tab 5: 名簿 ---
     with tab5:
         with st.form("reg_user", clear_on_submit=True):
             nn = st.text_input("氏名")
@@ -719,7 +779,6 @@ def main():
                             st.session_state.delete_confirm_id = row['id']
                             st.warning("もう一度押すと削除されます")
 
-    # --- Tab 6: 管理者 ---
     with tab6:
         st.write("### 🛠 管理者メニュー")
         with st.expander("🚨 緊急用: 全員への休暇手動配布"):
@@ -746,15 +805,15 @@ def main():
             with st.expander("② 休暇残数の個別修正"):
                 with st.form(key=f"balance_form_{tid}", clear_on_submit=True):
                     c1, c2 = st.columns(2)
-                    with c1: r = st.number_input("休み 増減", step=1)
-                    with c2: p = st.number_input("有休 増減", step=1)
+                    with c1: r = st.number_input("休み 増減", step=0.5) # 0.5刻みに
+                    with c2: p = st.number_input("有休 増減", step=0.5)
                     if st.form_submit_button("更新"):
                         if r != 0: update_user_balance(tid, "rest_balance", r)
                         if p != 0: update_user_balance(tid, "paid_leave_balance", p)
                         st.toast("更新しました"); st.success("更新しました"); t.sleep(3); st.rerun()
             with st.expander("③ 日別レコードの修正"):
                 edit_date = st.date_input("修正する日付を選択", value=datetime.now(JST))
-                conn = connect_to_gsheets()
+                # GSheet直接接続ではなくキャッシュ関数を利用
                 df_r = get_records_stable()
                 edit_date_str = edit_date.strftime('%Y-%m-%d')
                 rec = df_r[(df_r['user_id'].astype(str) == tid) & (df_r['date'] == edit_date_str)]
