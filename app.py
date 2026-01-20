@@ -1,3 +1,12 @@
+このエラーは、表（データフレーム）の中に「名前」のような**文字データ**が含まれているのに、**すべての列を「数字（小数）」としてフォーマットしようとしたため**に発生しています。
+
+`view_df.style.format("{:.1f}")` という部分を、**「数字の列だけフォーマットする」** ように書き換える必要があります。
+
+### 修正版 Pythonコード (`app.py`)
+
+デスクトップの `app.py` をすべて削除し、以下のコードを貼り付けて保存・プッシュしてください。
+
+```python
 import streamlit as st
 import pandas as pd
 import gspread
@@ -391,14 +400,11 @@ def auto_force_checkout():
                 elif rec_date_str == today_str and (now_dt.hour == 23 and now_dt.minute >= 55): should_close = True
                 if should_close:
                     row_idx = i + 2
-                    current_note = r['note'] or ""
-                    new_note = (str(current_note) + " (強制退勤)").strip()
+                    new_note = (str(r['note'] or "") + " (強制退勤)").strip()
                     ws.update_cell(row_idx, 5, force_time_str)
                     ws.update_cell(row_idx, 8, new_note)
                     updated_count += 1
-        if updated_count > 0:
-            clear_cache()
-            st.toast(f"{updated_count}件の未退勤レコードを23:55で締めました")
+        if updated_count > 0: st.toast(f"{updated_count}件の未退勤レコードを23:55で締めました")
         st.session_state.last_force_checkout = now_dt
     except Exception: pass
 
@@ -442,7 +448,7 @@ def admin_force_grant_all(grant_type):
         if grant_type == "rest":
             col_bal = ws.find("rest_balance").col
             col_last = ws.find("last_reset_week").col
-            ws.update_cell(row, col_bal, 1) # 強制付与は1にする？+1にする？ とりあえず1リセット
+            ws.update_cell(row, col_bal, 1)
             ws.update_cell(row, col_last, cur_week)
             count += 1
         elif grant_type == "paid":
@@ -451,7 +457,6 @@ def admin_force_grant_all(grant_type):
             ws.update_cell(row, col_bal, 2)
             ws.update_cell(row, col_last, cur_month)
             count += 1
-    clear_cache()
     return f"{count}名のデータをリセットしました。"
 
 def admin_update_record(record_id, edit_date, new_in_t, new_out_t, new_note, mode_override):
@@ -528,7 +533,6 @@ def generate_calendar_html(year, month, df_data, user_name):
     html += "</tbody></table></div>"
     return html
 
-# --- メインアプリ ---
 def main():
     st.set_page_config(page_title="M1出勤管理", layout="wide")
     st.title(f"M1 出勤管理")
@@ -540,10 +544,14 @@ def main():
     run_global_auto_grant()
     auto_force_checkout()
 
-    users = get_users_stable()
-    
-    if users is None or users.empty:
+    users = get_users_stable() # 頑丈版を使用
+
+    if users.empty:
+        st.warning("データを読み込んでいます...")
         user_names = {}
+        # キャッシュが空ならリトライを促す
+        if st.button("リロード"):
+            st.rerun()
     else:
         user_names = {row['name']: str(row['id']) for index, row in users.iterrows()}
     
@@ -555,7 +563,6 @@ def main():
     
     if selected_user_name != "(選択してください)":
         user_id = user_names[selected_user_name]
-        
         if st.session_state.last_checked_user != user_id:
             u_current = users[users['id'].astype(str) == user_id].iloc[0]
             filled_logs = auto_fill_missing_days(user_id, float(u_current['rest_balance']))
@@ -570,7 +577,6 @@ def main():
         if selected_user_name != "(選択してください)":
             user_id = user_names[selected_user_name]
             u_row = users[users['id'].astype(str) == user_id].iloc[0]
-            
             st.write(f"### {selected_user_name} さんの操作")
             col1, col2 = st.columns([1, 1])
             with col1:
@@ -578,25 +584,19 @@ def main():
                 is_holiday = is_weekend(datetime.now(JST))
                 holiday_chk = st.checkbox("祝日・休日出勤 (罰金なし)", value=is_holiday)
                 
-                # ★修正: 出勤ボタンのロジック (半休対応)
                 if st.button("出勤 🟢", type="primary", use_container_width=True):
                     now = datetime.now(JST)
                     date_str = now.strftime('%Y-%m-%d')
-                    
-                    # 今日のレコードがあるかチェック
                     exists, rec = has_record_for_date(user_id, date_str)
                     
                     if exists:
-                        # 既にレコードがある場合
                         status_val = str(rec['status'])
                         if "午前休" in status_val:
-                            # 午前休なら13時出勤扱い
                             fine, _ = calculate_late_fine(now, start_hour=WORK_SPLIT_HOUR)
                             if fine > MAX_DAILY_FINE: fine = MAX_DAILY_FINE
                             update_half_day_clock_in(user_id, now, fine, "(午前休出勤)")
                             st.toast("出勤しました(午前休)"); st.success("出勤しました"); t.sleep(2); st.rerun()
                         elif "午後休" in status_val:
-                            # 午後休なら9時出勤扱い
                             fine, _ = calculate_late_fine(now, start_hour=WORK_START_HOUR)
                             if fine > MAX_DAILY_FINE: fine = MAX_DAILY_FINE
                             update_half_day_clock_in(user_id, now, fine, "(午後休出勤)")
@@ -604,11 +604,9 @@ def main():
                         else:
                             st.error("本日は既に記録が存在します")
                     else:
-                        # 新規出勤
                         fine, status = 0, "休日出勤"
                         if not (is_holiday or holiday_chk): fine, status = calculate_late_fine(now)
                         if fine > MAX_DAILY_FINE: fine = MAX_DAILY_FINE
-                        
                         success, msg = add_record(user_id, status, fine, clock_in=now.strftime('%H:%M:%S'), note="土日祝" if (is_holiday or holiday_chk) else "")
                         if success: st.toast(f"出勤しました ({status})"); st.success("出勤しました"); t.sleep(2); st.rerun()
                         else: st.error(msg)
@@ -617,7 +615,8 @@ def main():
                     note = st.text_input("退勤備考")
                     if st.form_submit_button("退勤 🔴", use_container_width=True):
                         now = datetime.now(JST)
-                        # 退勤ロジック(update_record_out内で半休判定済み)
+                        early_fine = 0
+                        # 午後休・午前休判定などはupdate_record_out内で実施
                         if update_record_out(user_id, now, "退勤済", 0, note):
                             st.toast("退勤しました"); st.success("退勤しました"); t.sleep(3); st.rerun()
                         else: st.error("出勤記録が見つかりません")
@@ -661,8 +660,7 @@ def main():
                             st.error(f"残数が足りません (必要: {cost}, 残: {current_bal})")
 
                 st.divider()
-                if st.button("無断・通常欠勤 (¥1000)", use_container_width=True):
-                    register_absence(user_id); t.sleep(3); st.rerun()
+                if st.button("無断・通常欠勤 (¥1000)", use_container_width=True): register_absence(user_id); t.sleep(3); st.rerun()
                 with st.expander("特別欠勤 (¥0)"):
                     with st.form(key="sp_abs_form", clear_on_submit=True):
                         reas = st.selectbox("理由", ["風邪(特殊)", "就活", "学校関連", "その他"])
@@ -696,21 +694,27 @@ def main():
             
             st.divider()
             st.subheader("📊 週別・累計リスト (全期間)")
-            df_all_m = df.copy()
+            # 全員表示のためユーザー一覧ベース
+            df_all_m = df.copy() # 全データ
             df_all_m['date_dt'] = pd.to_datetime(df_all_m['date'])
             df_all_m['fine'] = pd.to_numeric(df_all_m['fine'], errors='coerce').fillna(0)
+            
             users['id'] = users['id'].astype(str)
             if not df_all_m.empty:
                 df_all_m['user_id'] = df_all_m['user_id'].astype(str)
                 merged = pd.merge(df_all_m, users[['id', 'name']], left_on='user_id', right_on='id', how='left')
                 merged['week'] = merged['date'].apply(get_week_label)
                 pivot = merged.pivot_table(index='name', columns='week', values='fine', aggfunc='sum', fill_value=0)
-            else: pivot = pd.DataFrame()
+            else:
+                pivot = pd.DataFrame()
+
             u_init = users[['name', 'initial_fine']].set_index('name')
             u_init['initial_fine'] = pd.to_numeric(u_init['initial_fine'], errors='coerce').fillna(0)
-            pivot = pivot.join(u_init, how='outer').fillna(0)
+            pivot = pivot.join(u_init, how='outer').fillna(0) # outer joinで全員表示
             pivot.rename(columns={'initial_fine': '運用前罰金'}, inplace=True)
             pivot['Total'] = pivot.sum(axis=1)
+            
+            # ソート
             cols = [c for c in pivot.columns if c not in ['運用前罰金', 'Total']]
             cols.sort()
             final_cols = ['運用前罰金'] + cols + ['Total']
@@ -722,7 +726,7 @@ def main():
         if not users.empty:
             view_df = users[['name', 'rest_balance', 'paid_leave_balance']].copy()
             view_df.columns = ['名前', '休み(残)', '有休(残)']
-            # floatで見やすく
+            # ★修正: float変換してエラー回避
             view_df['休み(残)'] = view_df['休み(残)'].astype(float)
             view_df['有休(残)'] = view_df['有休(残)'].astype(float)
             
@@ -733,14 +737,14 @@ def main():
                 for idx, u_row in users.iterrows():
                     uid = str(u_row['id'])
                     u_recs = df_r[df_r['user_id'] == uid]
-                    # 半休などもカウントに含める（回数ベースか日数ベースか。ここでは回数）
-                    rest_used = len(u_recs[u_recs['status'].str.contains('休み|午前休|午後休')])
-                    paid_used = len(u_recs[u_recs['status'].str.contains('有休')])
+                    rest_used = len(u_recs[u_recs['status'].str.contains('休み|午前休|午後休', na=False)])
+                    paid_used = len(u_recs[u_recs['status'].str.contains('有休', na=False)])
                     usage_data.append({'名前': u_row['name'], '休み(使用回数)': rest_used, '有休(使用回数)': paid_used})
             df_usage = pd.DataFrame(usage_data)
             if df_usage.empty: df_usage = pd.DataFrame(columns=['名前', '休み(使用回数)', '有休(使用回数)'])
             c3_1, c3_2 = st.columns(2)
-            with c3_1: st.dataframe(view_df.style.format("{:.1f}").applymap(lambda x: 'color:blue', subset=['休み(残)']).applymap(lambda x: 'color:green', subset=['有休(残)']), use_container_width=True)
+            # ★修正: フォーマット指定を辞書型にして名前列を除外
+            with c3_1: st.dataframe(view_df.style.format({'休み(残)': '{:.1f}', '有休(残)': '{:.1f}'}).applymap(lambda x: 'color:blue', subset=['休み(残)']).applymap(lambda x: 'color:green', subset=['有休(残)']), use_container_width=True)
             with c3_2: st.dataframe(df_usage, use_container_width=True)
 
     with tab4:
@@ -837,3 +841,5 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+```
