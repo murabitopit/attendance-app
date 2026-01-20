@@ -1,4 +1,3 @@
-
 import streamlit as st
 import pandas as pd
 import gspread
@@ -422,36 +421,74 @@ def admin_force_grant_all(grant_type):
     clear_cache()
     return f"{count}名のデータをリセットしました。"
 
+# ★修正: 管理者権限での半休・全休変更ロジックを追加
 def admin_update_record(record_id, edit_date, new_in_t, new_out_t, new_note, mode_override):
     msg_type = "success"
     msg = ""
+    
+    # 日時オブジェクトの生成
+    dt_in = datetime.combine(edit_date, new_in_t)
+    dt_out = datetime.combine(edit_date, new_out_t)
+    
+    status = ""
+    total_fine = 0
+    
     if mode_override == "自動計算 (時刻から判定)":
-        dt_in = datetime.combine(edit_date, new_in_t)
-        dt_out = datetime.combine(edit_date, new_out_t)
-        late_fine, status = calculate_late_fine(dt_in)
-        early_fine = calculate_early_fine(dt_out)
+        # 通常の計算 (9-15)
+        late_fine, status = calculate_late_fine(dt_in, WORK_START_HOUR)
+        early_fine = calculate_early_fine(dt_out, WORK_END_HOUR)
         total_fine = late_fine + early_fine
-        if total_fine > MAX_DAILY_FINE: total_fine = MAX_DAILY_FINE
         if early_fine > 0: status += "/早退"
         if late_fine == 1000: status = "欠勤(遅刻超過)"
-        admin_update_record_direct(record_id, new_in_t.strftime('%H:%M:%S'), new_out_t.strftime('%H:%M:%S'), status, total_fine, new_note)
-        msg = f"再計算完了: {status}"
-    elif mode_override == "「全休」に変更":
-        admin_update_record_direct(record_id, "", "", "休み", 0, new_note + " (管理者変更)")
-        msg = "ステータスを「休み」に変更しました。(残数手動修正要)"
-        msg_type = "warning"
+        if total_fine > MAX_DAILY_FINE: total_fine = MAX_DAILY_FINE
+    
     elif mode_override == "「午前休」に変更":
-        admin_update_record_direct(record_id, "", "", "午前休", 0, new_note + " (管理者変更)")
-        msg = "ステータスを「午前休」に変更しました。(残数手動修正要)"
-        msg_type = "warning"
+        # 午前休の計算 (開始13:00, 終了15:00)
+        status = "午前休"
+        late_fine, _ = calculate_late_fine(dt_in, WORK_SPLIT_HOUR) # 13:00基準
+        early_fine = calculate_early_fine(dt_out, WORK_END_HOUR)   # 15:00基準
+        total_fine = late_fine + early_fine
+        
+        if late_fine > 0: status += "(遅刻)"
+        if early_fine > 0: status += "(早退)"
+        if total_fine > MAX_DAILY_FINE: total_fine = MAX_DAILY_FINE
+
     elif mode_override == "「午後休」に変更":
-        admin_update_record_direct(record_id, "", "", "午後休", 0, new_note + " (管理者変更)")
-        msg = "ステータスを「午後休」に変更しました。(残数手動修正要)"
-        msg_type = "warning"
+        # 午後休の計算 (開始9:00, 終了13:00)
+        status = "午後休"
+        late_fine, _ = calculate_late_fine(dt_in, WORK_START_HOUR) # 9:00基準
+        early_fine = calculate_early_fine(dt_out, WORK_SPLIT_HOUR) # 13:00基準
+        total_fine = late_fine + early_fine
+        
+        if late_fine > 0: status += "(遅刻)"
+        if early_fine > 0: status += "(早退)"
+        if total_fine > MAX_DAILY_FINE: total_fine = MAX_DAILY_FINE
+
+    elif mode_override == "「全休」に変更":
+        # 全休は罰金0、時間は空にする
+        status = "休み"
+        total_fine = 0
+        new_in_t = "" # 時間を消すために空文字化フラグとして扱う
+        new_out_t = ""
+
     elif mode_override == "「有休」に変更":
-        admin_update_record_direct(record_id, "", "", "有休", 0, new_note + " (管理者変更)")
-        msg = "ステータスを「有休」に変更しました。(残数手動修正要)"
-        msg_type = "warning"
+        # 有休は罰金0、時間は空にする
+        status = "有休"
+        total_fine = 0
+        new_in_t = ""
+        new_out_t = ""
+
+    # 時間文字列の生成（全休・有休の場合は空文字）
+    in_str = new_in_t.strftime('%H:%M:%S') if new_in_t != "" else ""
+    out_str = new_out_t.strftime('%H:%M:%S') if new_out_t != "" else ""
+    
+    # 備考に管理者変更を追記
+    if "(管理者変更)" not in new_note:
+        new_note = (new_note + " (管理者変更)").strip()
+
+    admin_update_record_direct(record_id, in_str, out_str, status, total_fine, new_note)
+    msg = f"修正完了: {status} (罰金:{total_fine}円)"
+    
     return msg, msg_type
 
 def generate_calendar_html(year, month, df_data, user_name):
